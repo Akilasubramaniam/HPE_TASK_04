@@ -1,0 +1,112 @@
+import pandas as pd
+import numpy as np
+from prophet import Prophet
+from sklearn.metrics import r2_score
+from sklearn.utils import shuffle
+from sklearn.model_selection import train_test_split
+import warnings
+
+warnings.filterwarnings("ignore")
+
+# === Load Data ===
+df_ue = pd.read_csv("Avg_UE_Number_Data.csv", on_bad_lines='skip')
+df_dl = pd.read_csv("DL_Prb_Utilization_Data.csv", on_bad_lines='skip')
+
+# === Preprocess ===
+df_ue["Timestamp"] = pd.to_datetime(df_ue["Timestamp"], errors="coerce")
+df_dl["Timestamp"] = pd.to_datetime(df_dl["Timestamp"], errors="coerce")
+df_ue.dropna(subset=["Timestamp"], inplace=True)
+df_dl.dropna(subset=["Timestamp"], inplace=True)
+
+# === Merge and Clean ===
+df = pd.merge(df_ue, df_dl, on=["Timestamp", "NCI", "gNB"], suffixes=('_UE', '_DL'))
+df["Timestamp"] = df["Timestamp"].dt.round("15min")
+df = df.groupby(["Timestamp", "NCI"], as_index=False).mean(numeric_only=True)
+
+# === Feature Engineering ===
+df["hour"] = df["Timestamp"].dt.hour
+df["day_of_week"] = df["Timestamp"].dt.dayofweek
+df["weekofyear"] = df["Timestamp"].dt.isocalendar().week.astype(int)
+df["month"] = df["Timestamp"].dt.month
+df["is_weekend"] = df["day_of_week"] >= 5
+df["is_night"] = df["hour"].apply(lambda x: 1 if x < 6 or x >= 22 else 0)
+
+# Sort and apply rolling features
+df = df.sort_values(["NCI", "Timestamp"])
+df["rolling_mean_UE_1h"] = df.groupby("NCI")["Avg_UE_Number"].transform(lambda x: x.rolling(4, min_periods=1).mean())
+df["rolling_std_UE_1h"] = df.groupby("NCI")["Avg_UE_Number"].transform(lambda x: x.rolling(4, min_periods=1).std())
+df["rolling_mean_PRB_1h"] = df.groupby("NCI")["DL_Prb_Utilization"].transform(lambda x: x.rolling(4, min_periods=1).mean())
+df["rolling_std_PRB_1h"] = df.groupby("NCI")["DL_Prb_Utilization"].transform(lambda x: x.rolling(4, min_periods=1).std())
+
+df["UE_lag_1"] = df.groupby("NCI")["Avg_UE_Number"].shift(1)
+df["UE_lag_4"] = df.groupby("NCI")["Avg_UE_Number"].shift(4)
+df["PRB_lag_1"] = df.groupby("NCI")["DL_Prb_Utilization"].shift(1)
+df["PRB_lag_4"] = df.groupby("NCI")["DL_Prb_Utilization"].shift(4)
+
+df["load_ratio"] = df["DL_Prb_Utilization"] / df["Avg_UE_Number"]
+df.replace([np.inf, -np.inf], np.nan, inplace=True)
+df.dropna(inplace=True)
+
+# === Filter NCI with enough data ===
+nci_counts = df["NCI"].value_counts()
+selected_nci = nci_counts[nci_counts > 500].index[0]
+df_nci = df[df["NCI"] == selected_nci].sort_values("Timestamp").copy()
+
+# === Smoothing for Prophet input ===
+df_nci["Avg_UE_Number_Smoothed"] = df_nci["Avg_UE_Number"].rolling(3, min_periods=1).mean()
+df_nci["DL_Prb_Utilization_Smoothed"] = df_nci["DL_Prb_Utilization"].rolling(3, min_periods=1).mean()
+
+# === Prophet DataFrames ===
+df_ue_prophet = df_nci[["Timestamp", "Avg_UE_Number_Smoothed"]].rename(columns={"Timestamp": "ds", "Avg_UE_Number_Smoothed": "y"})
+df_prb_prophet = df_nci[["Timestamp", "DL_Prb_Utilization_Smoothed"]].rename(columns={"Timestamp": "ds", "DL_Prb_Utilization_Smoothed": "y"})
+
+# === Shuffle and Split ===
+df_ue_prophet = shuffle(df_ue_prophet, random_state=42)
+df_prb_prophet = shuffle(df_prb_prophet, random_state=42)
+
+train_ue, test_ue = train_test_split(df_ue_prophet, test_size=0.2, random_state=42)
+train_prb, test_prb = train_test_split(df_prb_prophet, test_size=0.2, random_state=42)
+
+# === Train Prophet ===
+model_ue = Prophet(changepoint_prior_scale=0.5)
+model_prb = Prophet(changepoint_prior_scale=0.5)
+
+model_ue.fit(train_ue)
+model_prb.fit(train_prb)
+
+# === Predict ===
+forecast_ue = model_ue.predict(test_ue[["ds"]])[["ds", "yhat"]]
+forecast_prb = model_prb.predict(test_prb[["ds"]])[["ds", "yhat"]]
+
+# === Align Actuals ===
+test_ue.set_index("ds", inplace=True)
+test_prb.set_index("ds", inplace=True)
+
+y_true_ue = test_ue.loc[forecast_ue["ds"], "y"].values
+y_pred_ue = forecast_ue["yhat"].values
+
+y_true_prb = test_prb.loc[forecast_prb["ds"], "y"].values
+y_pred_prb = forecast_prb["yhat"].values
+
+# === Combined Accuracy ===
+y_true_combined = np.vstack([y_true_ue, y_true_prb]).T
+y_pred_combined = np.vstack([y_pred_ue, y_pred_prb]).T
+r2_combined = r2_score(y_true_combined, y_pred_combined, multioutput='uniform_average')
+
+# === Save Forecast ===
+forecast_output = pd.DataFrame({
+    "Timestamp": forecast_ue["ds"],
+    "Avg_UE_Number_Actual": y_true_ue,
+    "Avg_UE_Number_Forecast": y_pred_ue,
+    "DL_Prb_Util_Actual": y_true_prb,
+    "DL_Prb_Util_Forecast": y_pred_prb,
+    "Combined_R2": r2_combined
+})
+forecast_output.to_csv("Combined_KPI_Forecast_Results.csv", index=False)
+df.to_csv("Feature_Engineered_KPI_Prophet.csv", index=False)
+
+# === Output ===
+print(" Randomized Prophet Forecast Complete")
+print(f"Combined R² Score (Randomized Test): {r2_combined:.4f}")
+print("Forecast saved to: Combined_KPI_Forecast_Results.csv")
+print("Feature-engineered data saved to: Feature_Engineered_KPI_Prophet.csv")
